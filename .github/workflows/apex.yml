@@ -2,7 +2,7 @@ name: Apex Quant XAUUSD Institutional Runner
 
 on:
   schedule:
-    # Berjalan setiap 5 menit dari Senin hingga Jumat
+    # Berjalan setiap 5 menit Senin - Jumat
     - cron: '*/5 * * * 1-5'
   workflow_dispatch:
 
@@ -45,6 +45,8 @@ jobs:
           APEX_MAX_DAILY_LOSS: "3.0"
           APEX_MAX_CONSEC_LOSSES: "3"
           APEX_ALLOW_RANGING: "true"
+          APEX_ENFORCE_HTF_FILTER: "true"
+          APEX_COUNTER_TREND_ALLOW_RATIO: "0.85"
           APEX_SKIP_KILLZONE_FILTER: "false"
           APEX_DRY_RUN: "false"
         run: |
