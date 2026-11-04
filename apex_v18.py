@@ -104,13 +104,15 @@ class Config:
     entry_max_chase_atr: float = 1.2     # Max distance before order is invalidated
     pending_stale_hours: float = 4.0     # Expiration for unfilled pending limits
 
-    # Filter Thresholds
+    # Filter Thresholds & Multi-Timeframe Rules
     adx_min: float = 20.0
     hurst_trend_min: float = 0.52
     hurst_meanrev_max: float = 0.48
     entropy_chaos_max: float = 0.85
-    allow_ranging_regime: bool = True    # Allow trades in normal ranging regime if consensus is high
-    news_blackout_minutes: int = 30     # ±30 min high-impact blackout window
+    allow_ranging_regime: bool = True      # Izinkan trading saat pasar ranging jika konsensus kuat
+    enforce_htf_filter: bool = True        # Multi-timeframe H4 filter
+    counter_trend_allow_ratio: float = 0.85 # Izinkan counter-trend scalps jika konsensus >= 85%
+    news_blackout_minutes: int = 30       # ±30 min high-impact blackout window
 
     # Parliament Consensus Quorum
     parliament_min_active: int = 6
@@ -176,6 +178,8 @@ class Config:
         cfg.kill_switch = env_bool("APEX_KILL_SWITCH", cfg.kill_switch)
         cfg.enable_ml_models = env_bool("APEX_ENABLE_ML", cfg.enable_ml_models)
         cfg.allow_ranging_regime = env_bool("APEX_ALLOW_RANGING", cfg.allow_ranging_regime)
+        cfg.enforce_htf_filter = env_bool("APEX_ENFORCE_HTF_FILTER", cfg.enforce_htf_filter)
+        cfg.counter_trend_allow_ratio = env_float("APEX_COUNTER_TREND_ALLOW_RATIO", cfg.counter_trend_allow_ratio)
         return cfg
 
     def validate(self) -> None:
@@ -1124,14 +1128,34 @@ class SignalGenerator:
         # Step 6: Multi-Timeframe Alignment
         if res.buy_ratio > res.sell_ratio:
             if h4_trend == "BEARISH":
-                res.skip_reason = "Sinyal BUY diblokir: H4 HTF Trend adalah BEARISH"
-                return res
-            res.direction = "BUY"
+                if self.cfg.enforce_htf_filter:
+                    if dom_ratio >= self.cfg.counter_trend_allow_ratio:
+                        res.direction = "BUY"
+                        if res.verdict == "EXECUTE_FULL":
+                            res.verdict = "EXECUTE_HALF"
+                        logging.info(f"Counter-trend BUY diizinkan: Konsensus Tinggi ({dom_ratio:.0%} >= {self.cfg.counter_trend_allow_ratio:.0%}) meskipun H4 BEARISH (Eksekusi 50% Lot)")
+                    else:
+                        res.skip_reason = f"Sinyal BUY diblokir: H4 HTF Trend adalah BEARISH (Konsensus {dom_ratio:.0%} < {self.cfg.counter_trend_allow_ratio:.0%})"
+                        return res
+                else:
+                    res.direction = "BUY"
+            else:
+                res.direction = "BUY"
         else:
             if h4_trend == "BULLISH":
-                res.skip_reason = "Sinyal SELL diblokir: H4 HTF Trend adalah BULLISH"
-                return res
-            res.direction = "SELL"
+                if self.cfg.enforce_htf_filter:
+                    if dom_ratio >= self.cfg.counter_trend_allow_ratio:
+                        res.direction = "SELL"
+                        if res.verdict == "EXECUTE_FULL":
+                            res.verdict = "EXECUTE_HALF"
+                        logging.info(f"Counter-trend SELL diizinkan: Konsensus Tinggi ({dom_ratio:.0%} >= {self.cfg.counter_trend_allow_ratio:.0%}) meskipun H4 BULLISH (Eksekusi 50% Lot)")
+                    else:
+                        res.skip_reason = f"Sinyal SELL diblokir: H4 HTF Trend adalah BULLISH (Konsensus {dom_ratio:.0%} < {self.cfg.counter_trend_allow_ratio:.0%})"
+                        return res
+                else:
+                    res.direction = "SELL"
+            else:
+                res.direction = "SELL"
 
         return res
 
