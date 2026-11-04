@@ -1,0 +1,161 @@
+name: APEX PREDATOR v18.0
+
+on:
+  schedule:
+    # Otomatis jalan setiap 15 menit hari Senin s.d. Jumat (forex/gold trading week)
+    - cron: '*/15 * * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Pilih tahap testing'
+        required: true
+        default: 'full_validation'
+        type: choice
+        options:
+          - full_validation
+          - live_promote
+          - smoke_only
+          - selftest_only
+
+  push:
+    branches: [main, master]
+    paths:
+      - 'apex_v18.py'
+      - '.github/workflows/apex.yml'
+      - 'requirements.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apex-predator-v18
+  cancel-in-progress: false
+
+jobs:
+  apex-manual:
+    name: APEX Manual — ${{ github.event.inputs.stage }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📚 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: "1️⃣  Selftest — validasi config"
+        if: |
+          github.event.inputs.stage == 'full_validation' ||
+          github.event.inputs.stage == 'live_promote' ||
+          github.event.inputs.stage == 'selftest_only'
+        env:
+          APEX_DRY_RUN: 'true'
+        run: python apex_v18.py selftest
+
+      - name: "2️⃣  Test Telegram"
+        if: github.event.inputs.stage == 'full_validation'
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APEX_DRY_RUN:     'false'
+        run: python apex_v18.py test-tg
+
+      - name: "3️⃣  Smoke — fetch data + parliament vote"
+        if: |
+          github.event.inputs.stage == 'full_validation' ||
+          github.event.inputs.stage == 'smoke_only'
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          OANDA_API_KEY:       ${{ secrets.OANDA_API_KEY }}
+          APEX_DRY_RUN:        'true'
+        run: python apex_v18.py smoke
+
+      - name: "4️⃣  Run DRY — full pipeline tanpa eksekusi riil"
+        if: github.event.inputs.stage == 'full_validation'
+        env:
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN:         'true'
+          APEX_SYMBOL:          'XAUUSD'
+          APEX_SKIP_KILLZONE_FILTER: 'true'
+        run: python apex_v18.py run
+
+      - name: "5️⃣  Run LIVE — kirim sinyal siap eksekusi MT5"
+        if: github.event.inputs.stage == 'live_promote'
+        env:
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN:         'false'
+          APEX_SYMBOL:          'XAUUSD'
+        run: python apex_v18.py run
+
+      - name: 📋 Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-state-manual-${{ github.run_number }}
+          path: apex_state_v18.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  apex-schedule:
+    name: APEX Scheduled Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    if: github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📚 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: 🧪 Selftest
+        run: python apex_v18.py selftest
+
+      - name: 🚀 Scheduled run
+        env:
+          GIST_ID:              ${{ secrets.GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TELEGRAM_TOKEN:       ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          OANDA_API_KEY:        ${{ secrets.OANDA_API_KEY }}
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          APEX_DRY_RUN: ${{ vars.APEX_LIVE_ENABLED == 'true' && 'false' || 'true' }}
+          APEX_SYMBOL:          'XAUUSD'
+        run: python apex_v18.py run
+
+      - name: 📋 Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-sched-${{ github.run_number }}
+          path: apex_state_v18.json
+          retention-days: 3
+          if-no-files-found: ignore
