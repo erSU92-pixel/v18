@@ -101,7 +101,7 @@ class Config:
 
     # Entry & Limit Order Parameters
     entry_pullback_atr: float = 0.25     # Pullback depth for institutional limit
-    entry_max_chase_atr: float = 1.2     # Max distance before order is invalidated
+    entry_max_chase_atr: float = 2.0     # Max distance before order defaults to ATR
     pending_stale_hours: float = 4.0     # Expiration for unfilled pending limits
 
     # Filter Thresholds & Multi-Timeframe Rules
@@ -1188,7 +1188,7 @@ class SignalGenerator:
     def compute_levels(
         self, m5: pd.DataFrame, side: str, ob: Optional[dict]
     ) -> Tuple[float, float, float, float, float]:
-        """Calculates precise Entry (Limit), Stop Loss, and TP1/TP2/TP3 targets."""
+        """Calculates precise Entry (Limit), Stop Loss, and TP1/TP2/TP3 targets with resilient fallback."""
         atr = Indicators.atr_last(m5)
         if atr <= 0:
             raise ValueError("ATR cannot be zero or negative")
@@ -1201,16 +1201,23 @@ class SignalGenerator:
         ob_low = ob["low"] if ob else price
 
         if side == "BUY":
-            if ob_high < price:
-                entry = ob_high - (ob_high - ob_low) * 0.5
+            ob_candidate = (ob_high - (ob_high - ob_low) * 0.5) if (ob and ob_high < price) else None
+            # Check if OB candidate is within safe pullback distance
+            if ob_candidate and (price - ob_candidate) <= self.cfg.entry_max_chase_atr * atr:
+                entry = ob_candidate
+                sl_ref = ob_low
             else:
                 entry = price - atr * self.cfg.entry_pullback_atr
+                sl_ref = entry - atr * self.cfg.atr_sl_mult
+
             entry = min(entry, price - atr * 0.05)
-            if abs(price - entry) > self.cfg.entry_max_chase_atr * atr:
-                raise ValueError("Entry too far from market price (excessive slippage risk)")
-            sl = min(ob_low, entry) - spread_buf
+            # Ensure entry is always within safe pullback bounds
+            if (price - entry) > self.cfg.entry_max_chase_atr * atr:
+                entry = price - atr * self.cfg.entry_pullback_atr
+
+            sl = min(sl_ref, entry - atr * 0.5) - spread_buf
             if entry <= sl:
-                raise ValueError(f"Invalid BUY levels: Entry={entry} <= SL={sl}")
+                sl = entry - atr * self.cfg.atr_sl_mult - spread_buf
 
             tp1 = entry + atr * self.cfg.atr_tp1_mult
             tp2 = entry + atr * self.cfg.atr_tp2_mult
@@ -1218,16 +1225,23 @@ class SignalGenerator:
             return round(entry, dec), round(sl, dec), round(tp1, dec), round(tp2, dec), round(tp3, dec)
 
         else:
-            if ob_low > price:
-                entry = ob_low + (ob_high - ob_low) * 0.5
+            ob_candidate = (ob_low + (ob_high - ob_low) * 0.5) if (ob and ob_low > price) else None
+            # Check if OB candidate is within safe pullback distance
+            if ob_candidate and (ob_candidate - price) <= self.cfg.entry_max_chase_atr * atr:
+                entry = ob_candidate
+                sl_ref = ob_high
             else:
                 entry = price + atr * self.cfg.entry_pullback_atr
+                sl_ref = entry + atr * self.cfg.atr_sl_mult
+
             entry = max(entry, price + atr * 0.05)
-            if abs(entry - price) > self.cfg.entry_max_chase_atr * atr:
-                raise ValueError("Entry too far from market price (excessive slippage risk)")
-            sl = max(ob_high, entry) + spread_buf
+            # Ensure entry is always within safe pullback bounds
+            if (entry - price) > self.cfg.entry_max_chase_atr * atr:
+                entry = price + atr * self.cfg.entry_pullback_atr
+
+            sl = max(sl_ref, entry + atr * 0.5) + spread_buf
             if sl <= entry:
-                raise ValueError(f"Invalid SELL levels: SL={sl} <= Entry={entry}")
+                sl = entry + atr * self.cfg.atr_sl_mult + spread_buf
 
             tp1 = entry - atr * self.cfg.atr_tp1_mult
             tp2 = entry - atr * self.cfg.atr_tp2_mult
