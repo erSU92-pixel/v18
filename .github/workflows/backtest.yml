@@ -1,0 +1,35 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install -q numpy pandas requests scikit-learn scipy yfinance
+      - name: Download data XAUUSD (60 hari terakhir)
+        run: |
+          python -c "
+          import yfinance as yf, pandas as pd
+          d = yf.download('GC=F', period='60d', interval='5m', progress=False)
+          if isinstance(d.columns, pd.MultiIndex): d.columns = [c[0] for c in d.columns]
+          d = d.reset_index()
+          d.columns = [str(c).lower() for c in d.columns]
+          if 'date' in d.columns: d = d.rename(columns={'date': 'datetime'})
+          if 'datetime' in d.columns: d['datetime'] = pd.to_datetime(d['datetime'], utc=True)
+          d = d[['datetime','open','high','low','close','volume']].dropna()
+          d.to_csv('data.csv', index=False)
+          print(f'Saved {len(d)} bars')
+          "
+      - name: Run backtest
+        run: python apex.py backtest --csv data.csv -v 2>&1 | tee result.log
+      - name: Show result
+        if: always()
+        run: cat result.log
