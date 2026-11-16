@@ -493,8 +493,11 @@ class MarketDataHandler:
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open","high","low","close"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 100.0), errors="coerce").fillna(100.0)
-        return df.dropna(subset=["open","high","low","close"]).sort_values("datetime").reset_index(drop=True)
+            if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
+    else:
+        df["volume"] = 100.0
+    return df.dropna(subset=["open","high","low","close"]).sort_values("datetime").reset_index(drop=True)
 
     def fetch_dxy(self):
         if time.time() - self._dxy_ts < 300 and self._dxy is not None: return self._dxy
