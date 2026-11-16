@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-APEX PREDATOR v22.1 — SMC LIQUIDITY SWEEP (INSTITUTIONAL FIXED)
+APEX PREDATOR v23.0 — INSTITUTIONAL TREND-SWEEP (SMC + ATR FIX)
 ===============================================================================
 """
-
 from __future__ import annotations
 import subprocess, sys, os
 
@@ -27,20 +26,23 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 import numpy as np, pandas as pd, requests
 
-VERSION = "22.1-SMC-FIXED"
+VERSION = "23.0-TREND-SWEEP"
 NY_TZ, LONDON_TZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Europe/London"), timezone.utc
 
 @dataclass
 class Config:
     gist_id: str = ""; gist_token: str = ""
-    gist_state_file: str = "apex_state_v22.json"; local_state_file: str = "apex_state_v22.json"
+    gist_state_file: str = "apex_state_v23.json"; local_state_file: str = "apex_state_v23.json"
     symbol: str = "XAUUSD"
     
     account_balance: float = 1000.0
     risk_pct: float = 1.0
     max_daily_loss_pct: float = 3.0
     
-    sl_atr_mult: float = 1.0
+    atr_period: int = 14
+    sl_atr_mult: float = 1.5     # SL = Sweep + 1.5 ATR
+    rr_ratio: float = 2.5        # TP = 2.5x Jarak SL (1:2.5 RR)
+    
     skip_killzone: bool = False
     dry_run: bool = False
     
@@ -161,16 +163,25 @@ class SMCStrategy:
     
     def _get_asian_range(self, df: pd.DataFrame, current_dt: pd.Timestamp) -> Tuple[float, float]:
         current_date = current_dt.date()
-        # Hanya ambil data dari jam 00:00 - 06:59 UTC pada tanggal berjalan
         asian_bars = df[(df["datetime"].dt.date == current_date) & (df["datetime"].dt.hour >= 0) & (df["datetime"].dt.hour < 7)]
         if asian_bars.empty: return 0.0, 0.0
         return float(asian_bars["high"].max()), float(asian_bars["low"].min())
 
+    def _get_trend(self, df: pd.DataFrame) -> str:
+        # Resample to 1H for trend calculation
+        h1 = df.set_index("datetime").resample("1h").agg({"close": "last"}).dropna().reset_index()
+        if len(h1) < 50: return "NEUTRAL"
+        ema50 = h1["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+        ema200 = h1["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+        if ema50 > ema200: return "BULLISH"
+        if ema50 < ema200: return "BEARISH"
+        return "NEUTRAL"
+
     def analyze(self, df: pd.DataFrame) -> dict:
         if len(df) < 50: return {"signal": "NEUTRAL"}
         
-        curr = df.iloc[-1] # Candle penutup (konfirmasi)
-        prev = df.iloc[-2] # Candle penyapu (sweep)
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
         
         now = curr["datetime"]
         lh = now.astimezone(LONDON_TZ).hour
@@ -183,27 +194,33 @@ class SMCStrategy:
         asian_high, asian_low = self._get_asian_range(df, now)
         if asian_high == 0 or asian_low == 0: return {"signal": "NEUTRAL"}
 
-        # --- SELL SETUP ---
-        # 1. Prev nyapu Asian High (high > asian_high).
-        # 2. Curr ditutup kembali di bawah Asian High.
-        if prev["high"] > asian_high and curr["close"] < asian_high:
-            entry = curr["close"]
-            sl = max(prev["high"], curr["high"]) + 0.5 # SL di atas sumbu tertinggi
-            tp = asian_low # Target likuiditas bawah
-            if (entry - tp) > (sl - entry) * 1.5: # Minimal 1:1.5 RR
+        trend = self._get_trend(df)
+        atr = self._calc_atr(df)
+
+        # --- SELL SETUP (Must be Bearish Trend) ---
+        if trend == "BEARISH":
+            # Prev nyapu Asian High, Curr ditutup kembali di bawah
+            if prev["high"] > asian_high and curr["close"] < asian_high:
+                entry = curr["close"]
+                sl = max(prev["high"], curr["high"]) + (atr * 0.5) # Buffer ATR
+                risk_dist = sl - entry
+                tp = entry - (risk_dist * self.cfg.rr_ratio)
                 return {"signal": "SELL", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
                 
-        # --- BUY SETUP ---
-        # 1. Prev nyapu Asian Low (low < asian_low).
-        # 2. Curr ditutup kembali di atas Asian Low.
-        if prev["low"] < asian_low and curr["close"] > asian_low:
-            entry = curr["close"]
-            sl = min(prev["low"], curr["low"]) - 0.5 # SL di bawah sumbu terendah
-            tp = asian_high
-            if (tp - entry) > (entry - sl) * 1.5:
+        # --- BUY SETUP (Must be Bullish Trend) ---
+        if trend == "BULLISH":
+            if prev["low"] < asian_low and curr["close"] > asian_low:
+                entry = curr["close"]
+                sl = min(prev["low"], curr["low"]) - (atr * 0.5)
+                risk_dist = entry - sl
+                tp = entry + (risk_dist * self.cfg.rr_ratio)
                 return {"signal": "BUY", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
 
         return {"signal": "NEUTRAL"}
+
+    def _calc_atr(self, df, period=14):
+        tr = pd.concat([df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(), (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
+        return tr.ewm(alpha=1.0/period, adjust=False).mean().iloc[-1]
 
 class RiskManager:
     def __init__(self, cfg, kv): self.cfg, self.kv = cfg, kv
@@ -284,7 +301,7 @@ class ApexBot:
                f"SL: <code>{res['sl']}</code>\n"
                f"TP: <code>{res['tp']}</code>\n\n"
                f"📦 Lot: <code>{lot}</code>\n"
-               f"🧠 Logic: Liquidity Sweep Rejection")
+               f"🧠 Logic: H1 Trend + Liquidity Sweep")
                
         if self.tg.send(msg):
             journal.append({
