@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-APEX PREDATOR v21.0 — VOLATILITY SQUEEZE BREAKOUT (XAUUSD QUANT ENGINE)
+APEX PREDATOR v22.0 — SMC LIQUIDITY SWEEP & FVG (INSTITUTIONAL EDITION)
 ===============================================================================
-Strategy: Institutional Volatility Contraction (Squeeze) & Expansion Breakout.
-Pillars  : Bollinger Bands, Keltner Channels, ATR Trailing Stop.
-Risk     : Hard SL 1.5 ATR, Trailing ATR, Max Daily Drawdown Lock.
+Strategy: Smart Money Concepts (Order Flow).
+Focus   : Asian Range Sweep -> Fair Value Gap -> Entry -> Opposing Liquidity.
+Time    : London & New York Killzones ONLY.
 ===============================================================================
 """
 from __future__ import annotations
@@ -23,39 +23,32 @@ def _ensure_deps():
 
 _ensure_deps()
 
-import argparse, atexit, hashlib, html, json, logging, math, random, re, signal, threading, time
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+import argparse, atexit, hashlib, json, logging, re, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 import numpy as np, pandas as pd, requests
 
-VERSION = "21.0-SQUEEZE"
+VERSION = "22.0-SMC"
 NY_TZ, LONDON_TZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Europe/London"), timezone.utc
 
-# ═══════════════════ CONFIGURATION ═══════════════════
 @dataclass
 class Config:
     gist_id: str = ""; gist_token: str = ""
-    gist_state_file: str = "apex_state_v21.json"; local_state_file: str = "apex_state_v21.json"
+    gist_state_file: str = "apex_state_v22.json"; local_state_file: str = "apex_state_v22.json"
     symbol: str = "XAUUSD"
     
-    # Account & Risk
     account_balance: float = 1000.0
     risk_pct: float = 1.0
     max_daily_loss_pct: float = 3.0
     
-    # Strategy Parameters
-    bb_period: int = 20
-    bb_std: float = 2.0
-    kc_period: int = 20
-    kc_mult: float = 1.5
     atr_period: int = 14
-    sl_atr_mult: float = 1.5
+    sl_atr_mult: float = 1.0     # SL sangat ketat di ujung Sweep
+    tp_rr_ratio: float = 3.0     # Minimal 1:3 RR
     
-    # Execution
     skip_killzone: bool = False
     dry_run: bool = False
     
@@ -80,10 +73,9 @@ class Config:
         c.dry_run = eb("APEX_DRY_RUN", c.dry_run)
         return c
 
-# ═══════════════════ UTILITIES & INFRA ═══════════════════
 def redact(v):
     s = str(v)
-    for pat, rep in [(r"(ghp_[A-Za-z0-9_]{30,})", "ghp_****"), (r"(bot[0-9]+:[A-Za-z0-9_-]{30,})", "bot****:****"), (r"(Bearer\s+)[A-Za-z0-9_.-]+", r"\1****")]:
+    for pat, rep in [(r"(ghp_[A-Za-z0-9_]{30,})", "ghp_****"), (r"(bot[0-9]+:[A-Za-z0-9_-]{30,})", "bot****:****")]:
         s = re.sub(pat, rep, s, flags=re.IGNORECASE)
     return s
 
@@ -155,7 +147,6 @@ class TelegramNotifier:
             return True
         except: return False
 
-# ═══════════════════ DATA ENGINE ═══════════════════
 class MarketData:
     def __init__(self, http): self.http = http
     def fetch(self) -> pd.DataFrame:
@@ -172,67 +163,64 @@ class MarketData:
         except Exception as e:
             raise Exception(f"Data fetch error: {redact(e)}")
 
-# ═══════════════════ QUANT INDICATORS ═══════════════════
-class QuantMath:
-    @staticmethod
-    def atr(df, period=14):
-        tr = pd.concat([df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(), (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
-        return tr.ewm(alpha=1.0/period, adjust=False).mean()
-    
-    @staticmethod
-    def bollinger(s, period=20, std=2.0):
-        sma = s.rolling(period).mean()
-        sd = s.rolling(period).std(ddof=0)
-        return sma + std*sd, sma, sma - std*sd
-    
-    @staticmethod
-    def keltner(df, period=20, mult=1.5):
-        ema = df["close"].ewm(span=period, adjust=False).mean()
-        atr = QuantMath.atr(df, period)
-        return ema + mult*atr, ema, ema - mult*atr
-
-# ═══════════════════ STRATEGY ENGINE ═══════════════════
-class SqueezeStrategy:
+# ═══════════════════ SMART MONEY CONCEPTS (SMC) ═══════════════════
+class SMCStrategy:
     def __init__(self, cfg): self.cfg = cfg
     
+    def _get_asian_range(self, df: pd.DataFrame) -> Tuple[float, float]:
+        """Mendapatkan High/Low dari Sesi Asia (00:00 - 07:00 UTC)"""
+        asian_bars = df[(df["datetime"].dt.hour >= 0) & (df["datetime"].dt.hour < 7)]
+        if asian_bars.empty: return 0.0, 0.0
+        return float(asian_bars["high"].max()), float(asian_bars["low"].min())
+
+    def _is_fvg(self, df: pd.DataFrame, idx: int, is_bullish: bool) -> bool:
+        """Fair Value Gap (FVG) 3-candle pattern"""
+        if idx < 2: return False
+        c1, c2, c3 = df.iloc[idx-2], df.iloc[idx-1], df.iloc[idx]
+        if is_bullish:
+            return c3["low"] > c1["high"] # Gap up
+        else:
+            return c3["high"] < c1["low"] # Gap down
+
     def analyze(self, df: pd.DataFrame) -> dict:
         if len(df) < 50: return {"signal": "NEUTRAL"}
         
-        bb_up, bb_mid, bb_lo = QuantMath.bollinger(df["close"], self.cfg.bb_period, self.cfg.bb_std)
-        kc_up, kc_mid, kc_lo = QuantMath.keltner(df, self.cfg.kc_period, self.cfg.kc_mult)
-        atr = QuantMath.atr(df, self.cfg.atr_period)
+        now = df["datetime"].iloc[-1]
         
-        # Squeeze Detection (Bollinger inside Keltner)
-        squeeze_on = (bb_up < kc_up) & (bb_lo > kc_lo)
-        
-        # Current and Previous Bar
-        curr_close = df["close"].iloc[-1]
-        prev_squeeze = squeeze_on.iloc[-2] if len(squeeze_on) > 1 else False
-        
-        signal = "NEUTRAL"
-        sl = 0.0; tp = 0.0
-        
-        # 1. LONG BREAKOUT
-        if prev_squeeze and curr_close > bb_up.iloc[-1]:
-            signal = "BUY"
-            sl = curr_close - (atr.iloc[-1] * self.cfg.sl_atr_mult)
-            tp = curr_close + (atr.iloc[-1] * 4.0) # 1:2.6 RR
-            
-        # 2. SHORT BREAKOUT
-        elif prev_squeeze and curr_close < bb_lo.iloc[-1]:
-            signal = "SELL"
-            sl = curr_close + (atr.iloc[-1] * self.cfg.sl_atr_mult)
-            tp = curr_close - (atr.iloc[-1] * 4.0)
-            
-        return {
-            "signal": signal, 
-            "entry": round(curr_close, 2), 
-            "sl": round(sl, 2), 
-            "tp": round(tp, 2), 
-            "atr": atr.iloc[-1]
-        }
+        # 1. Filter Waktu: Hanya London (07-10) & NY (13-16) UTC
+        lh = now.astimezone(LONDON_TZ).hour
+        nh = now.astimezone(NY_TZ).hour
+        if not ((7 <= lh < 10) or (13 <= nh < 16)):
+            return {"signal": "NEUTRAL"}
 
-# ═══════════════════ RISK & OUTCOME MANAGER ═══════════════════
+        asian_high, asian_low = self._get_asian_range(df)
+        if asian_high == 0 or asian_low == 0: return {"signal": "NEUTRAL"}
+
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # 2. Liquidity Sweep & Rejection (SELL)
+        # Harga menyapu Asian High tapi ditutup kembali di bawahnya
+        if curr["high"] > asian_high and curr["close"] < asian_high and prev["high"] <= asian_high:
+            # Cari FVG Bearish
+            if self._is_fvg(df, len(df)-1, is_bullish=False) or self._is_fvg(df, len(df)-2, is_bullish=False):
+                sl = curr["high"] + 0.5 # SL di atas sumbu sweep
+                entry = curr["close"]
+                tp = asian_low # Target di likuiditas seberang (Asian Low)
+                if (entry - tp) > (sl - entry) * 1.5: # Pastikan minimal 1:1.5 RR
+                    return {"signal": "SELL", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
+
+        # 3. Liquidity Sweep & Rejection (BUY)
+        if curr["low"] < asian_low and curr["close"] > asian_low and prev["low"] >= asian_low:
+            if self._is_fvg(df, len(df)-1, is_bullish=True) or self._is_fvg(df, len(df)-2, is_bullish=True):
+                sl = curr["low"] - 0.5
+                entry = curr["close"]
+                tp = asian_high
+                if (tp - entry) > (entry - sl) * 1.5:
+                    return {"signal": "BUY", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
+
+        return {"signal": "NEUTRAL"}
+
 class RiskManager:
     def __init__(self, cfg, kv): self.cfg, self.kv = cfg, kv
     def calc_lot(self, balance, entry, sl):
@@ -248,11 +236,8 @@ class RiskManager:
         if state.get("date") != today:
             state = {"date": today, "start_bal": balance, "locked": False}
             self.kv.set("circuit_breaker", state); return True
-        
         dd = (state["start_bal"] - balance) / state["start_bal"] * 100
-        if dd >= self.cfg.max_daily_loss_pct:
-            return False
-        return True
+        return dd < self.cfg.max_daily_loss_pct
 
 class OutcomeTracker:
     def __init__(self, cfg, kv): self.cfg, self.kv = cfg, kv
@@ -266,41 +251,30 @@ class OutcomeTracker:
             
             for _, b in bars.iterrows():
                 if e["signal"] == "BUY":
-                    if b["low"] <= e["sl"]:
-                        e["outcome"] = "LOSS"; events.append(("CLOSE", e)); break
-                    if b["high"] >= e["tp"]:
-                        e["outcome"] = "WIN"; events.append(("CLOSE", e)); break
+                    if b["low"] <= e["sl"]: e["outcome"] = "LOSS"; events.append(("CLOSE", e)); break
+                    if b["high"] >= e["tp"]: e["outcome"] = "WIN"; events.append(("CLOSE", e)); break
                 else:
-                    if b["high"] >= e["sl"]:
-                        e["outcome"] = "LOSS"; events.append(("CLOSE", e)); break
-                    if b["low"] <= e["tp"]:
-                        e["outcome"] = "WIN"; events.append(("CLOSE", e)); break
+                    if b["high"] >= e["sl"]: e["outcome"] = "LOSS"; events.append(("CLOSE", e)); break
+                    if b["low"] <= e["tp"]: e["outcome"] = "WIN"; events.append(("CLOSE", e)); break
         self.kv.set("journal", journal); self.kv.save()
         return events
 
-# ═══════════════════ MAIN ORCHESTRATOR ═══════════════════
 class ApexBot:
     def __init__(self, cfg):
         self.cfg = cfg
         self.http = ResilientHttpClient()
         self.kv = KVStore(cfg, self.http)
         self.data = MarketData(self.http)
-        self.strategy = SqueezeStrategy(cfg)
+        self.strategy = SMCStrategy(cfg)
         self.risk = RiskManager(cfg, self.kv)
         self.outcome = OutcomeTracker(cfg, self.kv)
         self.tg = TelegramNotifier(self.http, cfg.dry_run)
-        
-    def _in_killzone(self, now):
-        if self.cfg.skip_killzone: return True
-        lh = now.astimezone(LONDON_TZ).hour + now.astimezone(LONDON_TZ).minute/60
-        nh = now.astimezone(NY_TZ).hour + now.astimezone(NY_TZ).minute/60
-        return (7 <= lh < 10) or (8 <= nh < 11) or (13 <= nh < 16)
 
     def run(self):
         self.kv.force_load()
         now = datetime.now(UTC)
         
-        if now.weekday() >= 5 or not self._in_killzone(now): return
+        if now.weekday() >= 5: return
         bal = self.cfg.account_balance
         if not self.risk.check_drawdown(bal): return
 
@@ -313,7 +287,7 @@ class ApexBot:
             events = self.outcome.update(df)
             for evt, tr in events:
                 icon = "✅" if tr["outcome"] == "WIN" else "❌"
-                self.tg.send(f"{icon} <b>Closed</b> {tr['signal']} | Outcome: {tr['outcome']}")
+                self.tg.send(f"{icon} <b>Closed</b> {tr['signal']} | {tr['outcome']}")
             return
 
         res = self.strategy.analyze(df)
@@ -326,27 +300,26 @@ class ApexBot:
                f"SL: <code>{res['sl']}</code>\n"
                f"TP: <code>{res['tp']}</code>\n\n"
                f"📦 Lot: <code>{lot}</code>\n"
-               f"🧠 Logic: Volatility Squeeze Breakout")
+               f"🧠 Logic: Liquidity Sweep + FVG")
                
         if self.tg.send(msg):
             journal.append({
                 "id": hashlib.md5(f"{now}_{res['signal']}".encode()).hexdigest()[:8],
                 "time": now.strftime("%Y-%m-%d %H:%M:%S"),
-                "signal": res["signal"],
-                "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
+                "signal": res["signal"], "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
                 "lot": lot, "outcome": "PENDING"
             })
             self.kv.set("journal", journal); self.kv.save()
 
-# ═══════════════════ BACKTESTER ═══════════════════
 class Backtester:
-    def __init__(self, cfg): self.cfg = cfg; self.strategy = SqueezeStrategy(cfg)
+    def __init__(self, cfg): self.cfg = cfg; self.strategy = SMCStrategy(cfg)
     def run(self, df, max_bars=None):
         bal = self.cfg.account_balance
         trades = []; active = None
         end = len(df) if not max_bars else min(len(df), max_bars)
         
-        for i in range(100, end):
+        # Simulasi per bar
+        for i in range(50, end):
             hist = df.iloc[:i].reset_index(drop=True)
             if active:
                 b = df.iloc[i]
@@ -378,14 +351,13 @@ class Backtester:
             "return_pct": round((bal/self.cfg.account_balance - 1)*100, 2)
         }
 
-# ═══════════════════ CLI ═══════════════════
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("command", nargs="?", default="run", choices=["run", "backtest"])
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--csv")
-    parser.add_argument("--max-bars", type=int, default=None) # <-- FIXED: Added max-bars argument
+    parser.add_argument("--max-bars", type=int, default=None)
     args = parser.parse_args()
     
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -398,7 +370,7 @@ if __name__ == "__main__":
         df = pd.read_csv(args.csv)
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open", "high", "low", "close"): df[c] = pd.to_numeric(df[c])
-        print(json.dumps(bt.run(df, args.max_bars), indent=2)) # <-- Passes max-bars to engine
+        print(json.dumps(bt.run(df, args.max_bars), indent=2))
     else:
         bot = ApexBot(cfg)
         bot.run()
