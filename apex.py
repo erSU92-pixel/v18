@@ -1713,72 +1713,123 @@ class BacktestEngine:
         h1["datetime"] = pd.to_datetime(h1["datetime"], utc=True)
         h4 = self._rs(df, "4h")
         h4["datetime"] = pd.to_datetime(h4["datetime"], utc=True)
+        
         trades = []
         bal = self.cfg.account_balance
         start = 200
         end = len(df) if max_bars is None else min(len(df), start + max_bars)
-        for i in range(start, end - 20):
+        
+        active_trade = None
+
+        for i in range(start, end):
+            current_bar = df.iloc[i]
+            ts = current_bar["datetime"]
+
+            # 1. JIKA ADA POSISI AKTIF, CEK TP/SL
+            if active_trade:
+                if not active_trade["filled"]:
+                    # Cek apakah limit order tersentuh
+                    if (active_trade["side"] == "BUY" and current_bar["low"] <= active_trade["entry"]) or \
+                       (active_trade["side"] == "SELL" and current_bar["high"] >= active_trade["entry"]):
+                        active_trade["filled"] = True
+                    elif (ts - active_trade["signal_time"]).total_seconds() > self.cfg.pending_stale_hours * 3600:
+                        active_trade = None # Order hangus
+                        continue
+                    else:
+                        continue # Masih menunggu limit
+
+                # Jika sudah filled, cek TP/SL
+                if active_trade["filled"]:
+                    res = self._sim_bar(active_trade, current_bar)
+                    if res:
+                        bal *= (1 + res["r"] * 0.01)
+                        trades.append({
+                            "time": ts.isoformat(), "side": active_trade["side"],
+                            "entry": active_trade["entry"], "sl": active_trade["sl"],
+                            "outcome": res["outcome"], "r": res["r"],
+                            "balance": round(bal, 2), "regime": active_trade["regime"]
+                        })
+                        active_trade = None
+                continue # JANGAN cari sinyal baru jika posisi masih berjalan
+
+            # 2. CARI SINYAL BARU (Hanya jika tidak ada posisi aktif)
             hist = df.iloc[:i].reset_index(drop=True)
             h1h = h1[h1["datetime"] <= hist["datetime"].iloc[-1]].reset_index(drop=True)
             h4h = h4[h4["datetime"] <= hist["datetime"].iloc[-1]].reset_index(drop=True)
+            
             if len(h1h) < 100 or len(h4h) < 50:
                 continue
+                
             sig = self.signal.generate(hist, hist, h1h, h4h)
             if sig.direction == "NEUTRAL" or sig.verdict == "CANCEL":
                 continue
+                
             ob = self.signal.detect_ob(hist, sig.direction)
             try:
                 entry, sl, tp1, tp2, tp3 = self.signal.compute_levels(hist, sig.direction, ob)
             except ValueError:
                 continue
-            fut = df.iloc[i:min(i + 200, len(df))].reset_index(drop=True)
-            res = self._sim(fut, sig.direction, entry, sl, tp1, tp2, tp3)
-            if res is None:
-                continue
-            bal *= (1 + res["r"] * 0.01)
-            trades.append({"time": hist["datetime"].iloc[-1].isoformat(), "side": sig.direction,
-                "entry": entry, "sl": sl, "outcome": res["outcome"], "r": res["r"],
-                "balance": round(bal, 2), "regime": sig.regime})
+                
+            active_trade = {
+                "side": sig.direction, "entry": entry, "sl": sl,
+                "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                "regime": sig.regime, "signal_time": ts,
+                "filled": False, "hit_tp1": False, "hit_tp2": False
+            }
+
         if not trades:
             return {"trades": 0, "message": "No signals"}
+            
         w = sum(1 for t in trades if t["outcome"].startswith("WIN"))
         l = sum(1 for t in trades if t["outcome"] == "LOSS")
         tr = sum(t["r"] for t in trades)
         eq = pd.Series([t["balance"] for t in trades])
         mdd = float(((eq.cummax() - eq) / eq.cummax()).max() * 100)
-        return {"trades": len(trades), "wins": w, "losses": l, "win_rate": round(w / len(trades) * 100, 2),
-                "total_r": round(tr, 2), "final_balance": round(bal, 2),
-                "return_pct": round((bal / self.cfg.account_balance - 1) * 100, 2),
-                "max_drawdown_pct": round(mdd, 2), "avg_r": round(tr / len(trades), 3)}
+        
+        return {
+            "trades": len(trades), "wins": w, "losses": l, 
+            "win_rate": round(w / len(trades) * 100, 2),
+            "total_r": round(tr, 2), "final_balance": round(bal, 2),
+            "return_pct": round((bal / self.cfg.account_balance - 1) * 100, 2),
+            "max_drawdown_pct": round(mdd, 2), "avg_r": round(tr / len(trades), 3)
+        }
 
     @staticmethod
-    def _sim(fut, side, entry, sl, tp1, tp2, tp3):
-        filled = False
-        for b in fut.itertuples(index=False):
-            if not filled:
-                if (side == "BUY" and b.low <= entry) or (side == "SELL" and b.high >= entry):
-                    filled = True
-                continue
-            d = abs(entry - sl)
-            r1, r2, r3 = abs(tp1 - entry) / d, abs(tp2 - entry) / d, abs(tp3 - entry) / d
-            if side == "BUY":
-                if b.low <= sl:
-                    return {"outcome": "LOSS", "r": -1.0}
-                if b.high >= tp3:
-                    return {"outcome": "WIN_TP3", "r": (r1 + r2 + r3) / 3}
-                if b.high >= tp2:
-                    return {"outcome": "WIN_TP2", "r": (r1 + r2) / 3}
-                if b.high >= tp1:
-                    return {"outcome": "WIN_BE", "r": r1 / 3}
-            else:
-                if b.high >= sl:
-                    return {"outcome": "LOSS", "r": -1.0}
-                if b.low <= tp3:
-                    return {"outcome": "WIN_TP3", "r": (r1 + r2 + r3) / 3}
-                if b.low <= tp2:
-                    return {"outcome": "WIN_TP2", "r": (r1 + r2) / 3}
-                if b.low <= tp1:
-                    return {"outcome": "WIN_BE", "r": r1 / 3}
+    def _sim_bar(t, bar):
+        side = t["side"]
+        sl, entry = t["sl"], t["entry"]
+        tp1, tp2, tp3 = t["tp1"], t["tp2"], t["tp3"]
+        d = abs(entry - sl)
+        r1, r2, r3 = abs(tp1 - entry)/d, abs(tp2 - entry)/d, abs(tp3 - entry)/d
+
+        # Konservatif: SL selalu dicek lebih dulu
+        if side == "BUY":
+            if bar["low"] <= sl: return {"outcome": "LOSS", "r": -1.0}
+            if bar["high"] >= tp3: return {"outcome": "WIN_TP3", "r": (r1+r2+r3)/3.0}
+            
+            if not t["hit_tp1"] and bar["high"] >= tp1:
+                t["hit_tp1"] = True
+            if t["hit_tp1"] and not t["hit_tp2"] and bar["high"] >= tp2:
+                t["hit_tp2"] = True
+            
+            # Jika TP1 kena, SL pindah ke BE (Entry). Jika tersentuh, tutup posisi.
+            if t["hit_tp1"] and bar["low"] <= entry:
+                 if t["hit_tp2"]: return {"outcome": "WIN_TP2", "r": (r1+r2)/3.0}
+                 else: return {"outcome": "WIN_BE", "r": r1/3.0}
+                 
+        else: # SELL
+            if bar["high"] >= sl: return {"outcome": "LOSS", "r": -1.0}
+            if bar["low"] <= tp3: return {"outcome": "WIN_TP3", "r": (r1+r2+r3)/3.0}
+            
+            if not t["hit_tp1"] and bar["low"] <= tp1:
+                t["hit_tp1"] = True
+            if t["hit_tp1"] and not t["hit_tp2"] and bar["low"] <= tp2:
+                t["hit_tp2"] = True
+                
+            if t["hit_tp1"] and bar["high"] >= entry:
+                 if t["hit_tp2"]: return {"outcome": "WIN_TP2", "r": (r1+r2)/3.0}
+                 else: return {"outcome": "WIN_BE", "r": r1/3.0}
+                 
         return None
 
 
