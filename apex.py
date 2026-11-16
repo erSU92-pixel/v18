@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v19.2 — Institutional XAUUSD Quant Engine
+APEX PREDATOR v19.3 — Institutional XAUUSD Quant Engine
 Single-file, production-ready.
 
 Commands:
@@ -78,7 +78,7 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-VERSION = "19.2-PRODUCTION"
+VERSION = "19.3-PRODUCTION"
 NY_TZ = ZoneInfo("America/New_York")
 LONDON_TZ = ZoneInfo("Europe/London")
 UTC = timezone.utc
@@ -206,6 +206,8 @@ class Config:
         c.counter_trend_allow_ratio = ef("APEX_COUNTER_TREND_ALLOW_RATIO", c.counter_trend_allow_ratio)
         c.enable_dxy_filter = eb("APEX_ENABLE_DXY", c.enable_dxy_filter)
         c.enable_adaptive_weights = eb("APEX_ENABLE_ADAPTIVE", c.enable_adaptive_weights)
+        c.parliament_min_active = ei("APEX_MIN_ACTIVE", c.parliament_min_active)
+        c.adx_min = ef("APEX_ADX_MIN", c.adx_min)
         return c
 
     def validate(self):
@@ -450,7 +452,6 @@ class Indicators:
 
     @staticmethod
     def rolling_correlation(a, b, window):
-        """v19.2: Full NaN/inf sanitization."""
         n = min(len(a), len(b), window + 1)
         if n < 5:
             return 0.0
@@ -934,7 +935,16 @@ class SignalGenerator:
         if len(self._dxy) < 30:
             return 0, 0.0
         try:
-            corr = Indicators.rolling_correlation(df["close"], self._dxy["close"], self.cfg.dxy_corr_window)
+            if "datetime" in df.columns:
+                gold_h1 = (df.set_index("datetime")
+                             .resample("1h", label="left", closed="left")
+                             .agg({"close": "last"})
+                             .dropna().reset_index())
+            else:
+                gold_h1 = df
+            if len(gold_h1) < 10:
+                return 0, 0.0
+            corr = Indicators.rolling_correlation(gold_h1["close"], self._dxy["close"], self.cfg.dxy_corr_window)
             dc = self._dxy["close"].reset_index(drop=True)
             e20 = Indicators.ema(dc, 20).iloc[-1]
             e50 = Indicators.ema(dc, 50).iloc[-1]
@@ -1050,7 +1060,12 @@ class SignalGenerator:
         res.active_models, res.votes_detail = active, details
         if self._dxy is not None and len(self._dxy) > 20:
             try:
-                res.dxy_corr = round(Indicators.rolling_correlation(m5["close"], self._dxy["close"], self.cfg.dxy_corr_window), 3)
+                gold_h1_for_corr = (m5.set_index("datetime")
+                                      .resample("1h", label="left", closed="left")
+                                      .agg({"close": "last"})
+                                      .dropna().reset_index())
+                res.dxy_corr = round(Indicators.rolling_correlation(
+                    gold_h1_for_corr["close"], self._dxy["close"], self.cfg.dxy_corr_window), 3)
             except Exception:
                 res.dxy_corr = 0.0
         tw = bw + sw
@@ -1243,7 +1258,6 @@ class RiskManagementEngine:
                 if datetime.now(UTC) < datetime.fromisoformat(lk):
                     return False, f"LOCKED until {lk}"
                 else:
-                    # v19.2: clear expired lock
                     del cb["locked_until"]
                     self.kv.set("circuit_breaker", cb)
             except Exception:
@@ -1657,7 +1671,6 @@ class Orchestrator:
             st["last_signal_type"] = res.direction
             st["last_signal_ts"] = now_str
             self.kv.set("state", st)
-        # v19.2: _st() already calls save() internally — removed redundant save
         self._st(lpx, now_str)
 
     def _st(self, px, ts):
