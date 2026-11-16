@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v19.1 — Institutional XAUUSD Quant Engine
+APEX PREDATOR v19.2 — Institutional XAUUSD Quant Engine
 Single-file, production-ready.
 
 Commands:
@@ -11,7 +11,6 @@ Commands:
   python apex.py state    → Dump state
   python apex.py backtest --csv f.csv
   python apex.py install  → Install deps manually
-  python apex.py          → Interactive menu
 """
 
 from __future__ import annotations
@@ -79,7 +78,7 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-VERSION = "19.1-PRODUCTION"
+VERSION = "19.2-PRODUCTION"
 NY_TZ = ZoneInfo("America/New_York")
 LONDON_TZ = ZoneInfo("Europe/London")
 UTC = timezone.utc
@@ -451,6 +450,7 @@ class Indicators:
 
     @staticmethod
     def rolling_correlation(a, b, window):
+        """v19.2: Full NaN/inf sanitization."""
         n = min(len(a), len(b), window + 1)
         if n < 5:
             return 0.0
@@ -460,10 +460,21 @@ class Indicators:
         if k < 5:
             return 0.0
         ra, rb = ra.iloc[-k:], rb.iloc[-k:]
-        va, vb = float(ra.var()), float(rb.var())
-        if va <= 1e-12 or vb <= 1e-12:
+        try:
+            va, vb = float(ra.var()), float(rb.var())
+            if not (math.isfinite(va) and math.isfinite(vb)):
+                return 0.0
+            if va <= 1e-12 or vb <= 1e-12:
+                return 0.0
+            cov = float(ra.cov(rb))
+            if not math.isfinite(cov):
+                return 0.0
+            rho = cov / math.sqrt(va * vb)
+            if not math.isfinite(rho):
+                return 0.0
+            return float(np.clip(rho, -1.0, 1.0))
+        except Exception:
             return 0.0
-        return float(np.clip(float(ra.cov(rb)) / math.sqrt(va * vb), -1.0, 1.0))
 
 
 # ═══════════════════ MARKET DATA ═══════════════════
@@ -668,6 +679,7 @@ class SignalResult:
     buy_score: float = 0.0
     sell_score: float = 0.0
     active_models: int = 0
+    total_models: int = 0
     votes_detail: List[Dict[str, Any]] = field(default_factory=list)
     regime: str = "UNKNOWN"
     hurst: float = 0.5
@@ -945,7 +957,7 @@ class SignalGenerator:
              ("RSI", self._rsi, 1.0), ("Stochastic", self._stoch, 0.9),
              ("BollingerBB", self._bollinger, 0.9), ("Ichimoku", self._ichimoku, 1.3),
              ("SMC_OB", self._smc_ob, 1.5), ("Wavelet", self._wavelet, 0.8)]
-        if self.cfg.enable_ml_models:
+        if self.cfg.enable_ml_models and HAS_SKLEARN:
             r.append(("ML_Ensemble", self._ml, 1.0))
         if self.cfg.enable_dxy_filter:
             r.append(("DXY_Inverse", self._dxy, 1.4))
@@ -1014,6 +1026,7 @@ class SignalGenerator:
         if dxy is not None:
             self.set_dxy(dxy)
         res = SignalResult()
+        res.total_models = len(self._registry)
         res.adx = Indicators.adx_last(m5)
         reg, H, E = self._regime(h1)
         res.regime, res.hurst, res.entropy = reg, H, E
@@ -1039,7 +1052,7 @@ class SignalGenerator:
             try:
                 res.dxy_corr = round(Indicators.rolling_correlation(m5["close"], self._dxy["close"], self.cfg.dxy_corr_window), 3)
             except Exception:
-                pass
+                res.dxy_corr = 0.0
         tw = bw + sw
         if tw > 1e-6:
             res.buy_ratio, res.sell_ratio = bw / tw, sw / tw
@@ -1229,6 +1242,10 @@ class RiskManagementEngine:
             try:
                 if datetime.now(UTC) < datetime.fromisoformat(lk):
                     return False, f"LOCKED until {lk}"
+                else:
+                    # v19.2: clear expired lock
+                    del cb["locked_until"]
+                    self.kv.set("circuit_breaker", cb)
             except Exception:
                 pass
         ds = cb.get("day_start_balance")
@@ -1559,6 +1576,8 @@ class Orchestrator:
         h4 = dfs["4h"].iloc[:-1].reset_index(drop=True)
         if len(m5) < self.cfg.min_bars_m5 or len(h1) < self.cfg.min_bars_h1:
             logging.warning("Insufficient bars")
+            if not m5.empty:
+                self._st(float(m5["close"].iloc[-1]), now_str)
             return
         lpx = float(m5["close"].iloc[-1])
         biso = m5.iloc[-1]["datetime"].strftime("%Y-%m-%d %H:%M:%S")
@@ -1614,7 +1633,7 @@ class Orchestrator:
                f"📦 <b>Lot: <code>{lot}</code></b>\n"
                f"💰 Bal: ${bal:.2f} | Risk: {ar:.2f}%\n"
                f"📊 B={res.buy_ratio:.0%} S={res.sell_ratio:.0%}\n"
-               f"🧠 {html.escape(res.verdict)} | Models {res.active_models}/13\n"
+               f"🧠 {html.escape(res.verdict)} | Models {res.active_models}/{res.total_models}\n"
                f"🌐 {html.escape(res.regime)} (H={res.hurst:.2f}, E={res.entropy:.2f})\n"
                f"💵 DXY corr: {res.dxy_corr:+.2f}\n"
                f"🕐 {html.escape(sess)}\n"
@@ -1638,8 +1657,8 @@ class Orchestrator:
             st["last_signal_type"] = res.direction
             st["last_signal_ts"] = now_str
             self.kv.set("state", st)
+        # v19.2: _st() already calls save() internally — removed redundant save
         self._st(lpx, now_str)
-        self.kv.save()
 
     def _st(self, px, ts):
         s = self.kv.get("state", {}) or {}
@@ -1661,7 +1680,10 @@ class BacktestEngine:
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open", "high", "low", "close"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 100.0), errors="coerce").fillna(100.0)
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
+        else:
+            df["volume"] = 100.0
         return df.dropna().sort_values("datetime").reset_index(drop=True)
 
     def _rs(self, df, rule):
