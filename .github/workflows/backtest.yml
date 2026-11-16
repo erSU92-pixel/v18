@@ -6,7 +6,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,7 +28,7 @@ jobs:
           d.to_csv('data.csv', index=False)
           print(f'Saved {len(d)} bars')
           "
-      - name: Backtest (full data, relaxed diagnostic)
+      - name: Backtest (3000 bars, relaxed diagnostic)
         env:
           APEX_ENABLE_ML: "false"
           APEX_ENFORCE_HTF_FILTER: "false"
@@ -36,8 +36,9 @@ jobs:
           APEX_ADX_MIN: "15"
           APEX_BALANCE: "1000.0"
         run: |
-          echo "▶ Starting backtest (full data, relaxed filters)..."
-          timeout 40m python apex.py backtest --csv data.csv -v 2>&1 | tee result.log
+          echo "▶ Starting backtest (3000 bars)..."
+          # TAMBAHAN --max-bars 3000 DI SINI
+          timeout 25m python apex.py backtest --csv data.csv --max-bars 3000 -v 2>&1 | tee result.log
       - name: Show result
         if: always()
         run: |
