@@ -14,7 +14,7 @@ jobs:
           python-version: '3.11'
       - name: Install
         run: pip install -q numpy pandas requests scikit-learn scipy yfinance
-      - name: Download data XAUUSD (60 hari terakhir)
+      - name: Download data
         run: |
           python -c "
           import yfinance as yf, pandas as pd
@@ -28,8 +28,16 @@ jobs:
           d.to_csv('data.csv', index=False)
           print(f'Saved {len(d)} bars')
           "
-      - name: Run backtest
-        run: python apex.py backtest --csv data.csv -v 2>&1 | tee result.log
+      - name: Backtest (cepat, 2000 bar, ML off)
+        env:
+          APEX_ENABLE_ML: "false"
+          APEX_BALANCE: "1000.0"
+        run: |
+          echo "▶ Starting backtest (2000 bars, ML disabled)..."
+          timeout 24m python apex.py backtest --csv data.csv --max-bars 2000 -v 2>&1 | tee result.log
+          echo "▶ Done"
       - name: Show result
         if: always()
-        run: cat result.log
+        run: |
+          echo "=== HASIL ==="
+          cat result.log
