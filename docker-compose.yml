@@ -1,0 +1,10 @@
+services:
+  apex-quant:
+    build: .
+    container_name: apex-quant-xauusd
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: ["run", "--loop", "--interval", "300"]
