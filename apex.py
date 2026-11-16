@@ -97,8 +97,8 @@ UTC = timezone.utc
 class Config:
     gist_id: str = ""
     gist_token: str = ""
-    gist_state_file: str = "apex_state_v19.json"
-    local_state_file: str = "apex_state_v19.json"
+    gist_state_file: str = "apex_state_v18.json"
+    local_state_file: str = "apex_state_v18.json"
 
     symbol: str = "XAUUSD"
     contract_size: float = 100.0
