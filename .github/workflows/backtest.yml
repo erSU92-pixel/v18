@@ -28,13 +28,16 @@ jobs:
           d.to_csv('data.csv', index=False)
           print(f'Saved {len(d)} bars')
           "
-      - name: Backtest (cepat, 2000 bar, ML off)
+      - name: Backtest (relaxed filters for diagnostic)
         env:
           APEX_ENABLE_ML: "false"
-          APEX_BALANCE: "1000.0"
+          APEX_ENFORCE_HTF_FILTER: "false"
+          APEX_ALLOW_RANGING: "true"
+          APEX_MIN_ACTIVE: "4"
+          APEX_ADX_MIN: "15"
         run: |
-          echo "▶ Starting backtest (2000 bars, ML disabled)..."
-          timeout 24m python apex.py backtest --csv data.csv --max-bars 2000 -v 2>&1 | tee result.log
+          echo "▶ Starting backtest (5000 bars, relaxed filters)..."
+          timeout 25m python apex.py backtest --csv data.csv --max-bars 5000 -v 2>&1 | tee result.log
           echo "▶ Done"
       - name: Show result
         if: always()
