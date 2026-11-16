@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-APEX PREDATOR v22.0 — SMC LIQUIDITY SWEEP & FVG (INSTITUTIONAL EDITION)
-===============================================================================
-Strategy: Smart Money Concepts (Order Flow).
-Focus   : Asian Range Sweep -> Fair Value Gap -> Entry -> Opposing Liquidity.
-Time    : London & New York Killzones ONLY.
+APEX PREDATOR v22.1 — SMC LIQUIDITY SWEEP (INSTITUTIONAL FIXED)
 ===============================================================================
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import subprocess, sys, os
 
 def _ensure_deps():
@@ -18,8 +14,7 @@ def _ensure_deps():
     for mod, pkg in [("numpy", req[0]), ("pandas", req[1]), ("requests", req[2])]:
         try: __import__(mod)
         except ImportError: missing.append(pkg)
-    if missing: 
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
+    if missing: subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
 
 _ensure_deps()
 
@@ -32,7 +27,7 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 import numpy as np, pandas as pd, requests
 
-VERSION = "22.0-SMC"
+VERSION = "22.1-SMC-FIXED"
 NY_TZ, LONDON_TZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Europe/London"), timezone.utc
 
 @dataclass
@@ -45,10 +40,7 @@ class Config:
     risk_pct: float = 1.0
     max_daily_loss_pct: float = 3.0
     
-    atr_period: int = 14
-    sl_atr_mult: float = 1.0     # SL sangat ketat di ujung Sweep
-    tp_rr_ratio: float = 3.0     # Minimal 1:3 RR
-    
+    sl_atr_mult: float = 1.0
     skip_killzone: bool = False
     dry_run: bool = False
     
@@ -167,57 +159,49 @@ class MarketData:
 class SMCStrategy:
     def __init__(self, cfg): self.cfg = cfg
     
-    def _get_asian_range(self, df: pd.DataFrame) -> Tuple[float, float]:
-        """Mendapatkan High/Low dari Sesi Asia (00:00 - 07:00 UTC)"""
-        asian_bars = df[(df["datetime"].dt.hour >= 0) & (df["datetime"].dt.hour < 7)]
+    def _get_asian_range(self, df: pd.DataFrame, current_dt: pd.Timestamp) -> Tuple[float, float]:
+        current_date = current_dt.date()
+        # Hanya ambil data dari jam 00:00 - 06:59 UTC pada tanggal berjalan
+        asian_bars = df[(df["datetime"].dt.date == current_date) & (df["datetime"].dt.hour >= 0) & (df["datetime"].dt.hour < 7)]
         if asian_bars.empty: return 0.0, 0.0
         return float(asian_bars["high"].max()), float(asian_bars["low"].min())
-
-    def _is_fvg(self, df: pd.DataFrame, idx: int, is_bullish: bool) -> bool:
-        """Fair Value Gap (FVG) 3-candle pattern"""
-        if idx < 2: return False
-        c1, c2, c3 = df.iloc[idx-2], df.iloc[idx-1], df.iloc[idx]
-        if is_bullish:
-            return c3["low"] > c1["high"] # Gap up
-        else:
-            return c3["high"] < c1["low"] # Gap down
 
     def analyze(self, df: pd.DataFrame) -> dict:
         if len(df) < 50: return {"signal": "NEUTRAL"}
         
-        now = df["datetime"].iloc[-1]
+        curr = df.iloc[-1] # Candle penutup (konfirmasi)
+        prev = df.iloc[-2] # Candle penyapu (sweep)
         
-        # 1. Filter Waktu: Hanya London (07-10) & NY (13-16) UTC
+        now = curr["datetime"]
         lh = now.astimezone(LONDON_TZ).hour
         nh = now.astimezone(NY_TZ).hour
+        
+        # Filter Waktu: Hanya London (07-10) & NY (13-16)
         if not ((7 <= lh < 10) or (13 <= nh < 16)):
             return {"signal": "NEUTRAL"}
 
-        asian_high, asian_low = self._get_asian_range(df)
+        asian_high, asian_low = self._get_asian_range(df, now)
         if asian_high == 0 or asian_low == 0: return {"signal": "NEUTRAL"}
 
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        # 2. Liquidity Sweep & Rejection (SELL)
-        # Harga menyapu Asian High tapi ditutup kembali di bawahnya
-        if curr["high"] > asian_high and curr["close"] < asian_high and prev["high"] <= asian_high:
-            # Cari FVG Bearish
-            if self._is_fvg(df, len(df)-1, is_bullish=False) or self._is_fvg(df, len(df)-2, is_bullish=False):
-                sl = curr["high"] + 0.5 # SL di atas sumbu sweep
-                entry = curr["close"]
-                tp = asian_low # Target di likuiditas seberang (Asian Low)
-                if (entry - tp) > (sl - entry) * 1.5: # Pastikan minimal 1:1.5 RR
-                    return {"signal": "SELL", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
-
-        # 3. Liquidity Sweep & Rejection (BUY)
-        if curr["low"] < asian_low and curr["close"] > asian_low and prev["low"] >= asian_low:
-            if self._is_fvg(df, len(df)-1, is_bullish=True) or self._is_fvg(df, len(df)-2, is_bullish=True):
-                sl = curr["low"] - 0.5
-                entry = curr["close"]
-                tp = asian_high
-                if (tp - entry) > (entry - sl) * 1.5:
-                    return {"signal": "BUY", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
+        # --- SELL SETUP ---
+        # 1. Prev nyapu Asian High (high > asian_high).
+        # 2. Curr ditutup kembali di bawah Asian High.
+        if prev["high"] > asian_high and curr["close"] < asian_high:
+            entry = curr["close"]
+            sl = max(prev["high"], curr["high"]) + 0.5 # SL di atas sumbu tertinggi
+            tp = asian_low # Target likuiditas bawah
+            if (entry - tp) > (sl - entry) * 1.5: # Minimal 1:1.5 RR
+                return {"signal": "SELL", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
+                
+        # --- BUY SETUP ---
+        # 1. Prev nyapu Asian Low (low < asian_low).
+        # 2. Curr ditutup kembali di atas Asian Low.
+        if prev["low"] < asian_low and curr["close"] > asian_low:
+            entry = curr["close"]
+            sl = min(prev["low"], curr["low"]) - 0.5 # SL di bawah sumbu terendah
+            tp = asian_high
+            if (tp - entry) > (entry - sl) * 1.5:
+                return {"signal": "BUY", "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2)}
 
         return {"signal": "NEUTRAL"}
 
@@ -300,7 +284,7 @@ class ApexBot:
                f"SL: <code>{res['sl']}</code>\n"
                f"TP: <code>{res['tp']}</code>\n\n"
                f"📦 Lot: <code>{lot}</code>\n"
-               f"🧠 Logic: Liquidity Sweep + FVG")
+               f"🧠 Logic: Liquidity Sweep Rejection")
                
         if self.tg.send(msg):
             journal.append({
@@ -318,7 +302,6 @@ class Backtester:
         trades = []; active = None
         end = len(df) if not max_bars else min(len(df), max_bars)
         
-        # Simulasi per bar
         for i in range(50, end):
             hist = df.iloc[:i].reset_index(drop=True)
             if active:
