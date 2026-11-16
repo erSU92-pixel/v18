@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v20.0 — Pure 14-Indicator Weighted Voting
-No ADX, No HTF, No Regime. Pure Indicator Democracy.
+APEX PREDATOR v20.1 — APEX SNIPER (High Conviction, Asymmetric RR)
 """
-
 from __future__ import annotations
 import subprocess, sys
 
@@ -41,7 +39,7 @@ try:
     HAS_SKLEARN = True
 except ImportError: HAS_SKLEARN = False
 
-VERSION = "20.0-PURE-INDICATORS"
+VERSION = "20.1-SNIPER"
 NY_TZ, LONDON_TZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Europe/London"), timezone.utc
 
 @dataclass
@@ -55,29 +53,28 @@ class Config:
     max_consecutive_losses: int = 3; dd_pause_hours: int = 24; max_daily_signals: int = 5
     cooldown_minutes: int = 45; opposite_cooldown_minutes: int = 120
     
-    # --- PARAMETER RR SEIMBANG ---
+    # --- PARAMETER APEX SNIPER ---
     atr_period: int = 14
-    atr_sl_mult: float = 1.5
-    atr_tp1_mult: float = 1.5
-    atr_tp2_mult: float = 2.5
-    atr_tp3_mult: float = 4.0
-    spread_buffer: float = 0.35; trailing_atr_mult: float = 1.5
+    atr_sl_mult: float = 1.5      # SL Ketat 1.5 ATR
+    atr_tp1_mult: float = 3.0     # TP1 3.0 ATR (Rasio 1:2)
+    atr_tp2_mult: float = 5.0     # TP2 5.0 ATR (Rasio 1:3.3)
+    atr_tp3_mult: float = 8.0     # TP3 8.0 ATR (Rasio 1:5.3)
     
+    spread_buffer: float = 0.35; trailing_atr_mult: float = 1.5
     session_atr_london: float = 1.00; session_atr_ny_open: float = 1.00; session_atr_ny_afternoon: float = 0.85; session_atr_asian: float = 1.20
     min_bars_m5: int = 100; min_bars_m15: int = 100; min_bars_h1: int = 100; min_bars_h4: int = 50
     m5_fetch_size: int = 800; max_stale_mult: float = 3.0
     entry_pullback_atr: float = 0.25; entry_max_chase_atr: float = 2.0; pending_stale_hours: float = 4.0
     
-    # --- PARAMETER VOTING MURNI ---
-    parliament_min_active: int = 4
-    parliament_full_ratio: float = 0.70
-    parliament_half_ratio: float = 0.60
+    # --- FILTER KETAT (Tren Wajib Kuat) ---
+    adx_min: float = 25.0             # Hanya entry jika tren kuat
+    allow_ranging_regime: bool = False # Dilarang entry saat sideways
+    enforce_htf_filter: bool = True    # Wajib searah H4
+    counter_trend_allow_ratio: float = 0.90 # Sangat sulit melawan tren H4
     
-    # Parameter di bawah ini diabaikan (dimatikan)
-    adx_min: float = 0.0 
-    allow_ranging_regime: bool = True 
-    enforce_htf_filter: bool = False
-    counter_trend_allow_ratio: float = 0.0
+    parliament_min_active: int = 6
+    parliament_full_ratio: float = 0.75    # Wajib 75% konsensus untuk Lot Penuh
+    parliament_half_ratio: float = 0.65    # 65% dapat Lot Setengah
 
     news_blackout_minutes: int = 30; enable_dxy_filter: bool = True; dxy_corr_window: int = 20; dxy_bias_threshold: float = 0.55
     enable_adaptive_weights: bool = True; adaptive_min_trades: int = 30; adaptive_weight_floor: float = 0.5; adaptive_weight_ceil: float = 1.8
@@ -106,6 +103,7 @@ class Config:
         c.skip_killzone_filter = eb("APEX_SKIP_KILLZONE_FILTER", c.skip_killzone_filter); c.dry_run = eb("APEX_DRY_RUN", c.dry_run)
         c.kill_switch = eb("APEX_KILL_SWITCH", c.kill_switch); c.enable_ml_models = eb("APEX_ENABLE_ML", c.enable_ml_models)
         c.enable_dxy_filter = eb("APEX_ENABLE_DXY", c.enable_dxy_filter); c.enable_adaptive_weights = eb("APEX_ENABLE_ADAPTIVE", c.enable_adaptive_weights)
+        c.parliament_min_active = ei("APEX_MIN_ACTIVE", c.parliament_min_active); c.adx_min = ef("APEX_ADX_MIN", c.adx_min)
         return c
     def validate(self):
         assert self.contract_size == 100.0 and 0.05 <= self.max_risk_pct_per_trade <= 5.0
@@ -204,6 +202,20 @@ class Indicators:
         v = Indicators.atr_series(df, period)
         return float(v.iloc[-1]) if not v.empty else 0.0
     @staticmethod
+    def adx_series(df, period=14):
+        h, l = df["high"], df["low"]; um, dm = h.diff(), -l.diff()
+        pdm = np.where((um > dm) & (um > 0), um, 0.0); mdm = np.where((dm > um) & (dm > 0), dm, 0.0)
+        atr = Indicators.true_range(df).ewm(alpha=1.0 / period, adjust=False).mean()
+        pdi = pd.Series(pdm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean()
+        mdi = pd.Series(mdm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean()
+        pi, mi = 100 * (pdi / (atr + 1e-9)), 100 * (mdi / (atr + 1e-9))
+        dx = 100 * ((pi - mi).abs() / (pi + mi + 1e-9))
+        return dx.ewm(alpha=1.0 / period, adjust=False).mean()
+    @staticmethod
+    def adx_last(df, period=14):
+        v = Indicators.adx_series(df, period)
+        return float(v.iloc[-1]) if not v.empty else 0.0
+    @staticmethod
     def macd(s, f=12, sl=26, sig=9):
         ml = Indicators.ema(s, f) - Indicators.ema(s, sl)
         sli = Indicators.ema(ml, sig)
@@ -218,6 +230,25 @@ class Indicators:
         k_f = 100.0 * ((df["close"] - lo) / (hi - lo + 1e-9))
         k = k_f.rolling(smooth).mean(); d = k.rolling(smooth).mean()
         return float(k.iloc[-1]), float(d.iloc[-1])
+    @staticmethod
+    def hurst(s, max_lags=30):
+        ts = s.values
+        if len(ts) < max_lags * 2: return 0.5
+        vl, taus = [], []
+        for lag in range(2, max_lags):
+            diff = ts[lag:] - ts[:-lag]; std = float(np.std(diff, ddof=1))
+            if std > 1e-12: vl.append(lag); taus.append(std)
+        if len(vl) < 3: return 0.5
+        try: return float(np.clip(np.polyfit(np.log(vl), np.log(taus), 1)[0], 0.0, 1.0))
+        except: return 0.5
+    @staticmethod
+    def shannon_entropy(s, bins=10):
+        r = s.pct_change().dropna()
+        if len(r) < bins * 2: return 0.5
+        c, _ = np.histogram(r, bins=bins, density=True); c = c[c > 0]
+        if c.size == 0: return 0.5
+        p = c / c.sum(); e = -np.sum(p * np.log2(p))
+        return float(np.clip(e / np.log2(bins), 0.0, 1.0))
     @staticmethod
     def rolling_correlation(a, b, window):
         n = min(len(a), len(b), window + 1)
@@ -279,7 +310,8 @@ MODEL_FAMILIES = {"EMA_Cross":"trend","EMA_Trend":"trend","Supertrend":"trend","
 class SignalResult:
     direction: str = "NEUTRAL"; verdict: str = "CANCEL"; buy_ratio: float = 0.0; sell_ratio: float = 0.0
     buy_score: float = 0.0; sell_score: float = 0.0; active_models: int = 0; total_models: int = 0
-    votes_detail: List[Dict[str, Any]] = field(default_factory=list); skip_reason: str = ""
+    votes_detail: List[Dict[str, Any]] = field(default_factory=list); regime: str = "UNKNOWN"
+    hurst: float = 0.5; entropy: float = 0.5; adx: float = 0.0; dxy_corr: float = 0.0; session: str = "UNKNOWN"; skip_reason: str = ""
 
 class SignalGenerator:
     def __init__(self, cfg, kv=None):
@@ -426,51 +458,78 @@ class SignalGenerator:
         if n < self.cfg.adaptive_min_trades: return base
         acc = h / max(1, n); f = float(np.clip(1.0 + (acc - 0.5) * 3.0, self.cfg.adaptive_weight_floor, self.cfg.adaptive_weight_ceil))
         return base * f
-
+    def _fam_cap(self, raw):
+        ft = defaultdict(lambda: {1: 0.0, -1: 0.0})
+        for name, (v, cf, sc) in raw.items():
+            if v != 0: ft[MODEL_FAMILIES.get(name, "other")][v] += sc
+        b = s = 0.0
+        for name, (v, cf, sc) in raw.items():
+            if v == 0: continue
+            fam = MODEL_FAMILIES.get(name, "other"); fd = max(ft[fam][1], ft[fam][-1])
+            mx = max((raw[k][2] for k in raw if MODEL_FAMILIES.get(k, "other") == fam), default=1.0)
+            cap = self.cfg.family_cap_multiplier * max(1.0, mx); sc2 = min(1.0, cap / max(fd, 1e-6)) if fd > 0 else 1.0; adj = sc * sc2
+            if v > 0: b += adj
+            else: s += adj
+        return b, s
+    def _regime(self, h1):
+        H, E = Indicators.hurst(h1["close"]), Indicators.shannon_entropy(h1["close"])
+        if E >= self.cfg.entropy_chaos_max: return "CHAOTIC", H, E
+        if H >= self.cfg.hurst_trend_min: return "TRENDING", H, E
+        if H <= self.cfg.hurst_meanrev_max: return "MEAN_REVERTING", H, E
+        return "RANGING", H, E
+    @staticmethod
+    def _htf(h4):
+        if len(h4) < 50: return "NEUTRAL"
+        c = h4["close"]; e20, e50 = Indicators.ema(c, 20), Indicators.ema(c, 50)
+        if c.iloc[-1] > e50.iloc[-1] and e20.iloc[-1] > e50.iloc[-1]: return "BULLISH"
+        if c.iloc[-1] < e50.iloc[-1] and e20.iloc[-1] < e50.iloc[-1]: return "BEARISH"
+        return "NEUTRAL"
+    def _mr(self, reg):
+        return {"TRENDING": self.cfg.min_ratio_trending, "MEAN_REVERTING": self.cfg.min_ratio_meanrev, "RANGING": self.cfg.min_ratio_ranging}.get(reg, self.cfg.min_ratio_default)
     def generate(self, m5, m15, h1, h4, dxy=None):
         if dxy is not None: self.set_dxy(dxy)
-        res = SignalResult(); res.total_models = len(self._registry)
-        raw, details, active = {}, [], 0
-        
-        # 1. Kalkulasi Skor Berbobot Murni
+        res = SignalResult(); res.total_models = len(self._registry); res.adx = Indicators.adx_last(m5)
+        reg, H, E = self._regime(h1); res.regime, res.hurst, res.entropy = reg, H, E; htf = self._htf(h4); raw, details, active = {}, [], 0
         for name, fn, w in self._registry:
             try: v, cf = fn(m5)
             except: v, cf = 0, 0.0
             aw = self._aw(name, w); sc = aw * cf if v != 0 else 0.0; raw[name] = (v, cf, sc)
             if v != 0: active += 1
-            details.append({"model": name, "vote": {1: "BUY", -1: "SELL", 0: "NEUTRAL"}[v], "conf": round(cf, 2), "weight": round(aw, 2), "score": round(sc, 2)})
-            
-        bw = sum(sc for v, cf, sc in raw.values() if v > 0)
-        sw = sum(sc for v, cf, sc in raw.values() if v < 0)
-        
-        res.buy_score, res.sell_score = round(bw, 2), round(sw, 2); res.active_models, res.votes_detail = active, details
+            details.append({"model": name, "vote": {1: "BUY", -1: "SELL", 0: "NEUTRAL"}[v], "family": MODEL_FAMILIES.get(name, "other"), "conf": round(cf, 2), "weight": round(aw, 2), "score": round(sc, 2)})
+        bw, sw = self._fam_cap(raw); res.buy_score, res.sell_score = round(bw, 2), round(sw, 2); res.active_models, res.votes_detail = active, details
+        if self._dxy is not None and len(self._dxy) > 20:
+            try: res.dxy_corr = round(Indicators.rolling_correlation(m5["close"], self._dxy["close"], self.cfg.dxy_corr_window), 3)
+            except: res.dxy_corr = 0.0
         tw = bw + sw
-        
         if tw > 1e-6: res.buy_ratio, res.sell_ratio = bw / tw, sw / tw
         
-        # 2. Aturan Kemenangan (Pure Democracy)
-        if tw < 1e-6:
-            res.skip_reason = "no directional"
-            return res
-            
-        dom = max(res.buy_ratio, res.sell_ratio)
+        if res.adx < self.cfg.adx_min: res.skip_reason = f"ADX {res.adx:.1f} < {self.cfg.adx_min}"; return res
+        if reg == "CHAOTIC": res.skip_reason = "CHAOTIC"; return res
+        if reg == "RANGING" and not self.cfg.allow_ranging_regime: res.skip_reason = "RANGING"; return res
+        if tw < 1e-6: res.skip_reason = "no directional"; return res
+        if active < self.cfg.parliament_min_active: res.skip_reason = f"quorum {self.cfg.parliament_min_active}"; return res
         
-        # Syarat minimal 60% konsensus
-        if dom < self.cfg.parliament_half_ratio:
-            res.skip_reason = f"consensus {dom:.0%} < 60%"
-            return res
-            
-        if dom >= self.cfg.parliament_full_ratio: 
-            res.verdict = "EXECUTE_FULL"
-        else: 
-            res.verdict = "EXECUTE_HALF"
-            
-        # Arah murni tanpa filter
-        if res.buy_ratio > res.sell_ratio: 
-            res.direction = "BUY"
-        else: 
-            res.direction = "SELL"
-            
+        dom = max(res.buy_ratio, res.sell_ratio); mr = self._mr(reg)
+        if dom < mr: res.skip_reason = f"consensus {dom:.0%} < {reg} min {mr:.0%}"; return res
+        
+        if dom >= self.cfg.parliament_full_ratio: res.verdict = "EXECUTE_FULL"
+        elif dom >= self.cfg.parliament_half_ratio: res.verdict = "EXECUTE_HALF"
+        else: res.verdict = "EXECUTE_MICRO"
+        
+        if res.buy_ratio > res.sell_ratio:
+            if htf == "BEARISH" and self.cfg.enforce_htf_filter:
+                if dom >= self.cfg.counter_trend_allow_ratio:
+                    res.direction = "BUY"
+                    if res.verdict == "EXECUTE_FULL": res.verdict = "EXECUTE_HALF"
+                else: res.skip_reason = f"BUY blocked H4"; return res
+            else: res.direction = "BUY"
+        else:
+            if htf == "BULLISH" and self.cfg.enforce_htf_filter:
+                if dom >= self.cfg.counter_trend_allow_ratio:
+                    res.direction = "SELL"
+                    if res.verdict == "EXECUTE_FULL": res.verdict = "EXECUTE_HALF"
+                else: res.skip_reason = f"SELL blocked H4"; return res
+            else: res.direction = "SELL"
         return res
 
     @staticmethod
