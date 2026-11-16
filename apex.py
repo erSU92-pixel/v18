@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-APEX PREDATOR v19.5 — Institutional XAUUSD Quant Engine
-High Reward Edition (Asymmetric Risk/Reward).
+APEX PREDATOR v19.6 — Institutional XAUUSD Quant Engine
+Trend-Only Edition (No Ranging, Wide SL, Strict ADX).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ try:
     HAS_SKLEARN = True
 except ImportError: HAS_SKLEARN = False
 
-VERSION = "19.5-PRODUCTION"
+VERSION = "19.6-PRODUCTION"
 NY_TZ, LONDON_TZ, UTC = ZoneInfo("America/New_York"), ZoneInfo("Europe/London"), timezone.utc
 
 @dataclass
@@ -55,18 +55,29 @@ class Config:
     max_consecutive_losses: int = 3; dd_pause_hours: int = 24; max_daily_signals: int = 5
     cooldown_minutes: int = 45; opposite_cooldown_minutes: int = 120
     
-    # --- PARAMETER HIGH REWARD (Rasio 1:2, 1:4, 1:6) ---
-    atr_period: int = 14; atr_sl_mult: float = 1.0; atr_tp1_mult: float = 2.0; atr_tp2_mult: float = 4.0; atr_tp3_mult: float = 6.0
+    # --- PARAMETER TREND-ONLY (Anti-Choppy) ---
+    atr_period: int = 14
+    atr_sl_mult: float = 2.0      # SL 2.0 ATR (Beri ruang napas)
+    atr_tp1_mult: float = 2.0     # TP1 2.0 ATR (RR 1:1)
+    atr_tp2_mult: float = 4.0     # TP2 4.0 ATR (RR 1:2)
+    atr_tp3_mult: float = 6.0     # TP3 6.0 ATR (RR 1:3)
+    
     spread_buffer: float = 0.35; trailing_atr_mult: float = 1.5
     session_atr_london: float = 1.00; session_atr_ny_open: float = 1.00; session_atr_ny_afternoon: float = 0.85; session_atr_asian: float = 1.20
     min_bars_m5: int = 100; min_bars_m15: int = 100; min_bars_h1: int = 100; min_bars_h4: int = 50
     m5_fetch_size: int = 800; max_stale_mult: float = 3.0
     entry_pullback_atr: float = 0.25; entry_max_chase_atr: float = 2.0; pending_stale_hours: float = 4.0
     
-    adx_min: float = 20.0; hurst_trend_min: float = 0.52; hurst_meanrev_max: float = 0.48; entropy_chaos_max: float = 0.85
-    allow_ranging_regime: bool = True; enforce_htf_filter: bool = True; counter_trend_allow_ratio: float = 0.85; news_blackout_minutes: int = 30
+    # --- FILTER KETAT (Hanya Tren Kuat) ---
+    adx_min: float = 25.0         # Hanya entry jika tren kuat (ADX > 25)
+    hurst_trend_min: float = 0.52
+    hurst_meanrev_max: float = 0.48
+    entropy_chaos_max: float = 0.85
+    allow_ranging_regime: bool = False  # DILARANG trading saat pasar mendatar
+    
+    enforce_htf_filter: bool = True; counter_trend_allow_ratio: float = 0.85; news_blackout_minutes: int = 30
     min_ratio_trending: float = 0.65; min_ratio_meanrev: float = 0.55; min_ratio_ranging: float = 0.60; min_ratio_default: float = 0.55
-    parliament_min_active: int = 6; parliament_full_ratio: float = 0.70; parliament_half_ratio: float = 0.60; family_cap_multiplier: float = 1.5
+    parliament_min_active: int = 6; parliament_full_ratio: float = 0.75; parliament_half_ratio: float = 0.65; family_cap_multiplier: float = 1.5
     enable_dxy_filter: bool = True; dxy_corr_window: int = 20; dxy_bias_threshold: float = 0.55
     enable_adaptive_weights: bool = True; adaptive_min_trades: int = 30; adaptive_weight_floor: float = 0.5; adaptive_weight_ceil: float = 1.8
     skip_killzone_filter: bool = False; dry_run: bool = False; kill_switch: bool = False
@@ -93,7 +104,8 @@ class Config:
         c.max_daily_loss_pct = ef("APEX_MAX_DAILY_LOSS", c.max_daily_loss_pct); c.max_consecutive_losses = ei("APEX_MAX_CONSEC_LOSSES", c.max_consecutive_losses)
         c.skip_killzone_filter = eb("APEX_SKIP_KILLZONE_FILTER", c.skip_killzone_filter); c.dry_run = eb("APEX_DRY_RUN", c.dry_run)
         c.kill_switch = eb("APEX_KILL_SWITCH", c.kill_switch); c.enable_ml_models = eb("APEX_ENABLE_ML", c.enable_ml_models)
-        c.allow_ranging_regime = eb("APEX_ALLOW_RANGING", c.allow_ranging_regime); c.enforce_htf_filter = eb("APEX_ENFORCE_HTF_FILTER", c.enforce_htf_filter)
+        c.allow_ranging_regime = False # FORCE FALSE
+        c.enforce_htf_filter = eb("APEX_ENFORCE_HTF_FILTER", c.enforce_htf_filter)
         c.counter_trend_allow_ratio = ef("APEX_COUNTER_TREND_ALLOW_RATIO", c.counter_trend_allow_ratio)
         c.enable_dxy_filter = eb("APEX_ENABLE_DXY", c.enable_dxy_filter); c.enable_adaptive_weights = eb("APEX_ENABLE_ADAPTIVE", c.enable_adaptive_weights)
         c.parliament_min_active = ei("APEX_MIN_ACTIVE", c.parliament_min_active); c.adx_min = ef("APEX_ADX_MIN", c.adx_min)
