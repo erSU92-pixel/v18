@@ -261,7 +261,6 @@ class OutcomeTracker:
         events = []
         for e in journal:
             if e["outcome"] != "PENDING": continue
-            # Simulasi pencarian hit SL/TP (Sederhana untuk versi ini)
             bars = df[df["datetime"] > pd.to_datetime(e["time"], utc=True)]
             if bars.empty: continue
             
@@ -302,14 +301,13 @@ class ApexBot:
         now = datetime.now(UTC)
         
         if now.weekday() >= 5 or not self._in_killzone(now): return
-        bal = self.cfg.account_balance # Bisa dikembangkan untuk compound
+        bal = self.cfg.account_balance
         if not self.risk.check_drawdown(bal): return
 
         try: df = self.data.fetch()
         except Exception as e: 
             logging.error(e); return
             
-        # Cek posisi aktif
         journal = self.kv.get("journal", []) or []
         if any(j["outcome"] == "PENDING" for j in journal): 
             events = self.outcome.update(df)
@@ -318,11 +316,9 @@ class ApexBot:
                 self.tg.send(f"{icon} <b>Closed</b> {tr['signal']} | Outcome: {tr['outcome']}")
             return
 
-        # Analisa Sinyal
         res = self.strategy.analyze(df)
         if res["signal"] == "NEUTRAL": return
         
-        # Eksekusi
         lot = self.risk.calc_lot(bal, res["entry"], res["sl"])
         msg = (f"🏛️ <b>APEX v{VERSION} — {res['signal']}</b>\n\n"
                f"Symbol: <b>{self.cfg.symbol}</b>\n"
@@ -389,6 +385,7 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--csv")
+    parser.add_argument("--max-bars", type=int, default=None) # <-- FIXED: Added max-bars argument
     args = parser.parse_args()
     
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -401,7 +398,7 @@ if __name__ == "__main__":
         df = pd.read_csv(args.csv)
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open", "high", "low", "close"): df[c] = pd.to_numeric(df[c])
-        print(json.dumps(bt.run(df), indent=2))
+        print(json.dumps(bt.run(df, args.max_bars), indent=2)) # <-- Passes max-bars to engine
     else:
         bot = ApexBot(cfg)
         bot.run()
