@@ -85,6 +85,11 @@ class KVStore:
                     resp = self.http.request("GET", url, headers=headers)
                     files = resp.json().get("files", {})
                     target_file = files.get(self.cfg.gist_state_file)
+                    if not (target_file and target_file.get("content")) and self.cfg.gist_state_file != "apex_state_v18.json":
+                        legacy_file = files.get("apex_state_v18.json")
+                        if legacy_file and legacy_file.get("content"):
+                            target_file = legacy_file
+                            logging.info("Migrating existing state from legacy Gist file: apex_state_v18.json")
                     if target_file and target_file.get("content"):
                         parsed = json.loads(target_file["content"])
                         self.data = self._hydrate_schema(parsed)

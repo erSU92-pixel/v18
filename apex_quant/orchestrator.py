@@ -92,24 +92,44 @@ class TradingBotOrchestrator:
             logging.info("Weekend market closed — Skipping iteration.")
             return
 
-        if not self._in_killzone(now):
-            logging.info("Outside institutional killzone — Skipping iteration.")
+        in_killzone = self._in_killzone(now)
+        journal_pre = self.kv.get("journal", []) or []
+        has_pending_or_open = any(j.get("outcome") == "PENDING" for j in journal_pre)
+
+        if not in_killzone and not has_pending_or_open:
+            logging.info(
+                "Outside institutional killzone (07:00-10:00 London, 08:00-11:00 & 13:00-16:00 NY) "
+                "— Skipping iteration (set APEX_SKIP_KILLZONE_FILTER=true to override)."
+            )
             return
 
         balance = self.risk.dynamic_balance()
 
-        # Step 1: Evaluate Circuit Breakers
-        ok, reason = self.risk.check_circuit_breakers(balance, now=now)
-        if not ok:
-            logging.info(f"Circuit Breaker Triggered: {reason}")
-            return
+        # Step 1: Evaluate Circuit Breakers (skip only if inside killzone; still track pending trades)
+        if in_killzone:
+            ok, reason = self.risk.check_circuit_breakers(balance, now=now)
+            if not ok:
+                logging.info(f"Circuit Breaker Triggered: {reason}")
+                if not has_pending_or_open:
+                    return
+                allow_new_signals = False
+            else:
+                allow_new_signals = True
+        else:
+            logging.info(
+                "Outside institutional killzone — Monitoring active/pending trades only (no new entries)."
+            )
+            allow_new_signals = False
 
-        # Step 2: High-Impact News & Rollover Blackout Filter
-        in_blackout, news_title = self.news.is_blackout(now=now)
-        if in_blackout:
-            logging.info(f"Safety Blackout Active: [{news_title}] — Halting new signals.")
-            self.kv.save()
-            return
+        # Step 2: High-Impact News & Rollover Blackout Filter (blocks new entries, still tracks open trades)
+        if allow_new_signals:
+            in_blackout, news_title = self.news.is_blackout(now=now)
+            if in_blackout:
+                logging.info(f"Safety Blackout Active: [{news_title}] — Halting new signals.")
+                self.kv.save()
+                if not has_pending_or_open:
+                    return
+                allow_new_signals = False
 
         # Step 3: Fetch Market Data with 4-Tier Failover
         try:
@@ -138,6 +158,9 @@ class TradingBotOrchestrator:
                     )
         except Exception as e:
             logging.warning(f"Outcome tracker non-fatal warning: {e}")
+
+        if not allow_new_signals:
+            return
 
         balance = self.risk.dynamic_balance()
 
