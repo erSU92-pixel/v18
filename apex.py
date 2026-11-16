@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 APEX PREDATOR v20.1 — APEX SNIPER (High Conviction, Asymmetric RR)
+Final Production Version.
 """
 from __future__ import annotations
 import subprocess, sys
@@ -66,6 +67,16 @@ class Config:
     m5_fetch_size: int = 800; max_stale_mult: float = 3.0
     entry_pullback_atr: float = 0.25; entry_max_chase_atr: float = 2.0; pending_stale_hours: float = 4.0
     
+    # --- VARIABEL REGIME & FILTER (YANG SEMPAT HILANG) ---
+    hurst_trend_min: float = 0.52
+    hurst_meanrev_max: float = 0.48
+    entropy_chaos_max: float = 0.85
+    min_ratio_trending: float = 0.65
+    min_ratio_meanrev: float = 0.55
+    min_ratio_ranging: float = 0.60
+    min_ratio_default: float = 0.55
+    family_cap_multiplier: float = 1.5
+
     # --- FILTER KETAT (Tren Wajib Kuat) ---
     adx_min: float = 25.0             # Hanya entry jika tren kuat
     allow_ranging_regime: bool = False # Dilarang entry saat sideways
