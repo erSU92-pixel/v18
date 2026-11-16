@@ -14,33 +14,59 @@ Commands:
   python apex.py          → Interactive menu
 """
 
-import subprocess, sys
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITICAL: from __future__ MUST be the very first statement after docstring
+# ─────────────────────────────────────────────────────────────────────────────
+from __future__ import annotations
+
+import subprocess
+import sys
+
 
 def _ensure_deps():
+    """Auto-install dependencies on first import."""
     req = ["numpy>=1.24,<3.0", "pandas>=2.0,<3.0", "requests>=2.31,<3.0"]
     opt = ["scikit-learn>=1.3,<2.0", "scipy>=1.11,<2.0"]
     missing = []
     for mod, pkg in [("numpy", req[0]), ("pandas", req[1]), ("requests", req[2])]:
-        try: __import__(mod)
-        except ImportError: missing.append(pkg)
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
     if missing:
         print(f"📦 Installing: {missing}", flush=True)
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
     missing_opt = []
     for mod, pkg in [("sklearn", opt[0]), ("scipy", opt[1])]:
-        try: __import__(mod)
-        except ImportError: missing_opt.append(pkg)
+        try:
+            __import__(mod)
+        except ImportError:
+            missing_opt.append(pkg)
     if missing_opt:
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing_opt])
         except subprocess.CalledProcessError:
             print("⚠️  Optional deps failed — reduced model set", flush=True)
 
+
 _ensure_deps()
 
-from __future__ import annotations
-import argparse, atexit, hashlib, html, json, logging, math, os, random, re, signal
-import threading, time
+# ─────────────────────────────────────────────────────────────────────────────
+# All other imports AFTER deps installed
+# ─────────────────────────────────────────────────────────────────────────────
+import argparse
+import atexit
+import hashlib
+import html
+import json
+import logging
+import math
+import os
+import random
+import re
+import signal
+import threading
+import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
